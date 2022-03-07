@@ -1,0 +1,746 @@
+---
+title: "Peak Bloom Prediction Demo"
+author: "Miaoshiqi Liu"
+date: "02/21/2022"
+output:
+  html_document:
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, 
+                      message = FALSE,
+                      fig.align = 'center',
+                      out.width = '80%')
+```
+
+## Instructions
+
+In this analysis we demonstrate a very simple way of predicting the peak bloom date in the coming decade for all four locations required by the competition.
+The models used here are very simple and are using only the historic data for these four locations, but no other information or covariates.
+At the end of this document ((#appendix-rnoaa)[Appendix A]), we also demonstrate a simple way to get historic temperature data for the four locations via the `rnoaa` package.
+
+For this demo analysis we are using methods from the _tidyverse_ of R packages.
+They can be installed via
+
+```{r, eval=FALSE}
+install.packages('tidyverse')
+```
+
+and then loaded via
+
+```{r}
+library(tidyverse)
+```
+```{r}
+# set palette
+cherry_cols <- c("#E87A90", "#91AD70")
+```
+
+## Loading the data
+
+The data for each of the three main sites is provided as simple text file in CSV format.
+Each file contains the dates of the peak bloom of the cherry trees at the respective site, alongside the geographical location of the site.
+
+The six columns in each data file are
+
+* _location_ a human-readable location identifier (`string`).
+* _lat_ (approximate) latitude of the cherry trees (`double`).
+* _long_ (approximate) longitude of the cherry trees (`double`).
+* _alt_ (approximate) altitude of the cherry trees (`double`).
+* _year_ year of the observation (`integer`).
+* *bloom_date* date of peak bloom of the cherry trees (ISO 8601 date `string`). The "peak bloom date" may be defined differently for different sites
+* *bloom_doy* days since January 1st of the year until peak bloom (`integer`). January 1st corresponds to `1`.
+
+In R, the data files can be read with `read.csv()` and concatenated with the `bind_rows()` function:
+
+```{r}
+cherry <- read.csv("data/washingtondc.csv") %>% 
+  bind_rows(read.csv("data/liestal.csv")) %>% 
+  bind_rows(read.csv("data/kyoto.csv"))
+```
+
+In this way, we now have the data for 3 locations, and we shall first of all focus on the location LW
+
+```{r}
+cherry.LW <- cherry %>% 
+  filter(location == "liestal")
+```
+
+## Visualizing the time series
+
+
+```{r, fig.width=8, fig.height=3, out.width='100%', fig.cap="Time series of peak bloom of cherry trees since 1880 at three different sites."}
+# cherry %>% 
+#   filter(year >= 1880) %>%
+#   ggplot(aes(x = year, y = bloom_doy)) +
+#   geom_point() +
+#   geom_step(linetype = 'dotted', color = 'gray50') +
+#   scale_x_continuous(breaks = seq(1880, 2020, by = 20)) +
+#   facet_grid(cols = vars(str_to_title(location))) +
+#   labs(x = "Year", y = "Peak bloom (days since Jan 1st)")
+```
+
+```{r, fig.width=8, fig.height=3, out.width='100%', fig.cap="Time series of peak bloom of cherry trees since 1880 at three different sites."}
+cherry.LW %>%
+  ggplot(aes(x = year, y = bloom_doy)) +
+  geom_point() +
+  geom_step(linetype = 'dotted', color = 'gray50') +
+  labs(x = "Year", y = "Peak bloom (days since Jan 1st)")
+
+cherry.LW %>%
+  ggplot(aes(x = bloom_doy)) +
+  geom_bar(fill = "#E87A90") + labs(x = "Peak bloom (days since Jan 1st)") + theme_light()
+summary(cherry.LW$bloom_doy)
+```
+## Gather data of the LW
+
+```{r}
+library(rnoaa)
+library(imputeTS)
+library(lubridate)
+```
+
+```{r, eval = FALSE}
+stations <- ghcnd_stations()
+```
+
+```{r}
+get_ghcnd <- function(station_id,
+											info_list = c("tmax", "tmin", "prcp"),
+                      date_range = c("1950-01-01", "2022-01-31")){
+  info1 <- ghcnd_search(stationid = station_id, var = c(info_list[1]))[[1]]
+  info_list <- info_list[-1]   
+
+  if (length(info_list) == 0) return(info1)
+  
+  for (info in info_list) {
+    info_tmp <- ghcnd_search(stationid = station_id, var = c(info), 
+             date_min = date_range[1], date_max = date_range[2])[[1]]
+    info1 <- merge(info1, info_tmp, by = "date") 
+  }
+  info1 <- info1 %>% select(date, tmax, tmin, prcp) %>%
+  mutate(tmax = tmax/10, tmin = tmin/10) %>%   # tenth of the C
+  mutate(year = as.integer(format(date, "%Y")),
+         month = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+         season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                      include.lowest = TRUE,
+                      labels = c("Winter", "Spring", "Summer", "Fall")),
+         year = if_else(month == 0, year + 1L, year)) %>%
+  mutate(month_name = if_else(month == 0, 12, month)) %>%
+  mutate(month_name = factor(month.name[as.integer(month_name)], levels = month.name)) 
+  
+  return(info1)
+}
+
+imp_temperature <- function(dat = weather, temps = "tmin") { 
+  for (temp in temps) {
+    # Convert to time series
+    temp_ori <- dat[, temp]
+    temp_series <- ts(temp_ori, frequency = 1)
+    dat$na <- is.na(temp_ori)
+    
+    # Use Kalman smoother to impute. Other options are also available
+    dat$imp <- na_kalman(temp_series)
+    
+    n_col <- ncol(dat)
+    colnames(dat)[n_col-1] <- paste0(temp, "_na")
+    colnames(dat)[n_col] <- paste0(temp, "_imp")
+  }
+  return(dat)
+}
+
+get_afdd <- function(dat) {
+  freeze_days <- dat %>% mutate(yday = yday(date)) %>% group_by(year) %>% filter(tmin_imp <= 0)
+  # Number of accumulative freezing days
+  freeze_days_n <- freeze_days %>% group_by(year) %>% summarise(afdd = n()) 
+  
+  # First and last freeze
+  first_freeze <- freeze_days %>% group_by(year) %>% summarise(first_freeze_date = min(date))
+  last_freeze <- freeze_days %>% group_by(year) %>% summarise(last_freeze_date = max(date))
+
+  first_freeze_yday <- first_freeze %>% mutate(first_freeze_yday = yday(first_freeze_date))
+  last_freeze_yday <- last_freeze %>% mutate(last_freeze_yday = yday(last_freeze_date))      
+  
+  year_range <- c(min(dat$year) : max(dat$year))
+  
+  freeze_info <- merge(data.frame(year = year_range), freeze_days_n, all.x = TRUE) 
+  freeze_info <- merge(freeze_info, first_freeze_yday, by = "year", all.x = TRUE)
+  freeze_info <- merge(freeze_info, last_freeze_yday, by = "year", all.x = TRUE)
+  return(freeze_info)
+}
+
+get_agdd <- function(dat) {
+  growing_days <- dat %>% mutate(yday = yday(date)) %>% group_by(year) %>% 
+    mutate(tavg_cal = (tmax_imp + tmin_imp)/2) %>% filter(tavg_cal > 0)
+  # Number of accumulative growing days
+  grow_days_n <- growing_days %>% group_by(year) %>% summarise(agdd = n()) 
+  
+  # First and last freeze
+  first_grow <- growing_days %>% group_by(year) %>% summarise(first_grow_date = min(date))
+  last_grow <- growing_days %>% group_by(year) %>% summarise(last_grow_date = max(date))
+
+  first_grow_yday <- first_grow %>% mutate(first_grow_yday = yday(first_grow_date))
+  last_grow_yday <- last_grow %>% mutate(last_grow_yday = yday(last_grow_date))      
+  
+  year_range <- c(min(dat$year) : max(dat$year))
+  
+  freeze_info <- merge(data.frame(year = year_range), grow_days_n, all.x = TRUE) 
+  freeze_info <- merge(freeze_info, first_grow_yday, by = "year", all.x = TRUE)
+  freeze_info <- merge(freeze_info, last_grow_yday, by = "year", all.x = TRUE)
+  
+  return(freeze_info)
+}
+
+
+get_temperature <- function (stationid) {
+  ghcnd_search(stationid = stationid, var = c("tmax"), 
+               date_min = "1950-01-01", date_max = "2022-01-31")[[1]] %>%
+  mutate(year = as.integer(format(date, "%Y")),
+         month = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+         season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                      include.lowest = TRUE,
+                      labels = c("Winter", "Spring", "Summer", "Fall")),
+         year = if_else(month == 0, year + 1L, year)) %>%
+  group_by(year, season) %>%
+  summarize(tmax_avg = mean(tmax, na.rm = TRUE))
+}
+```
+
+##### In fact we can only obtain complete data of daily tmax for LW, and only starts from 1953.9.1, so in in fact we can only from the spring and winter of 1954
+
+
+```{r}
+historic_temperatures <-
+  tibble(location = "washingtondc", get_temperature("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_temperature("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_temperature("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_temperature("CA001108395")))
+
+tempavg.LW <- get_temperature("GME00127786")
+
+weather.LW <- get_ghcnd(station_id = "GME00127786")
+
+weather.LW$date = as.character(weather.LW$date)
+
+tempdate.LW <- weather.LW %>% 
+  select(date, tmax, tmin, snwd, prcp) %>%
+  filter(date %in% cherry.LW$bloom_date) %>%
+  rename(bloom_date = date) %>%
+  left_join(cherry.LW, by = c("bloom_date"))
+
+tempavg.LW <- tempavg.LW %>%
+  filter(season %in% c("Spring")) %>%
+  left_join(cherry.LW, by = c("year"))
+  
+```
+
+
+###### EDA of LW
+
+```{r}
+tempdate.LW %>%
+  select(year, tmin, tmax) %>%
+  reshape2::melt(id = "year") %>%
+  ggplot() + geom_line(aes(x = year, y = value, color = variable)) + geom_point(aes(x = year, y = value, color = variable)) + scale_color_manual(values = cherry_cols) + labs(color='Temperature') 
+
+# and we may want to see the relationship between the bloom date and the temperature that makes the bloom happen
+tempdate.LW %>%
+  select(bloom_doy, tmax) %>%
+  ggplot() + geom_point(aes(x = bloom_doy, y = tmax), color = cherry_cols[1]) + ylab("Max temperature at the date of blossom")
+  
+cor(tempdate.LW$tmax, tempdate.LW$bloom_doy)
+
+lm.tempdate = lm(bloom_doy ~ tmax, data = tempdate.LW)
+summary(lm.tempdate)
+
+# both the scatterplot and the insignificant coefficient of tmax shows that, the temperature at the date of blossom does not vary significantly, and this does not actually change bloom date, the important thing is to know when would we obtain the high temperature to blossom, and this requires us to get the "average" temperature for spring, winter, the number of days that tmax is over some baseline in winter/spring. 
+# 
+# lm.tempavg = lm(bloom_doy ~ year + tmax_avg, data = tempavg.LW)
+# summary(lm.tempavg)
+```
+
+
+# Now we shall focus on how to obtain the tmin average and tmax average in winter ans spring, also prcp in winter and spring
+
+```{r}
+get_seasons.temperature <- function(station_id, info_list = c("tmax", "tmin", "prcp"),
+                      date_range = c("1950-01-01", "2022-01-31")){
+  dailyweather = get_ghcnd(station_id = station_id, info_list = info_list, date_range = date_range)
+  dailyweather = imp_temperature(dat = dailyweather, c("tmax", "tmin"))
+  
+  
+  agdd <- get_agdd(dailyweather)
+  afdd <- get_afdd(dailyweather)
+  
+  final_dat <- merge(agdd, afdd, by = "year")
+  
+  temp_prcp <- dailyweather %>%
+         group_by(year, season) %>%
+         summarize(tmax_avg = mean(tmax_imp), tmin_avg = mean(tmin_imp), prcp_avg = mean(prcp, na.rm = TRUE)) %>%
+         filter(season %in% c("Spring", "Winter")) %>% 
+    pivot_wider(names_from = "season", values_from = c("tmax_avg", "tmin_avg", "prcp_avg"))
+  
+  final_dat <- merge(final_dat, temp_prcp, by = "year")
+  
+  return(final_dat)
+}
+
+
+dailyweather = get_ghcnd(station_id = "GME00127786", info_list = c("tmax", "tmin", "snwd", "prcp"),
+                      date_range = c("1950-01-01", "2022-01-31"))
+
+
+
+cherry.weathers <- 
+  tibble(location = "washingtondc", get_seasons.temperature("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_seasons.temperature("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_seasons.temperature("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_seasons.temperature("CA001108395")))
+
+
+# historic_temperatures <-
+#   tibble(location = "washingtondc", get_temperature("USC00186350")) %>%
+#   bind_rows(tibble(location = "liestal", get_temperature("GME00127786"))) %>%
+#   bind_rows(tibble(location = "kyoto", get_temperature("JA000047759"))) %>%
+#   bind_rows(tibble(location = "vancouver", get_temperature("CA001108395")))
+
+
+```
+
+```{r}
+final.dat = cherry.weathers %>%
+merge(cherry, by = c("year", "location"), all.y = TRUE, all.x = TRUE) %>%
+  filter(year >= 1950)
+
+dat.LW = final.dat %>%
+  filter(location == "liestal")
+
+dat.DC = final.dat %>%
+  filter(location == "washingtondc")
+
+dat.KT = final.dat %>%
+  filter(location == "kyoto")
+
+dat.VC = final.dat %>%
+  filter(location == "vancouver")
+
+dat.VC$bloom_date[30:47] = c("2004-03-31", "2005-04-09", "2006-03-30", "2007-04-01", "2008-03-26", "2009-04-01", "2010-03-31", "2011-03-29", "2012-03-20", "2013-04-09", "2014-04-10", "2015-04-10", "2016-03-25", "2017-03-25", "2018-04-05", "2019-04-01", "2020-03-20", "2021-03-28")
+
+dat.VC$bloom_doy[30:47] = yday(dat.VC$bloom_date[30:47])
+   
+```
+
+
+## Visualize and model 
+
+```{r}
+dat.LW = na.omit(dat.LW)
+NROW(dat.LW)
+# So if we focus on this, we actually only have 66 data points
+# 1954 - 2021
+model.1 = lm(bloom_doy ~  year + afdd + tmax_avg_Spring*tmin_avg_Spring, data = dat.LW)
+summary(model.1)
+
+model.1.inveatigate = cbind(dat.LW, model.fit = round(model.1$fitted.values, 0))
+model.1.inveatigate %>%
+  select(year, bloom_doy, model.fit) %>%
+  reshape2::melt(id = "year") %>%
+  ggplot() + geom_line(aes(x = year, y = value, color = variable)) + geom_point(aes(x = year, y = value, color = variable)) + scale_color_manual(values = cherry_cols) + labs(color='Type', title = "Linear Model 1") 
+
+
+bc = MASS::boxcox(dat.LW$bloom_doy ~ dat.LW$year + dat.LW$tmax_avg_Spring*dat.LW$tmin_avg_Spring + dat.LW$afdd, lambda = seq(-3, 3, 1/10))
+# The lambda is roughly 2
+model.2 = lm((bloom_doy^2 - 1)/2 ~  year + afdd + tmax_avg_Spring*tmin_avg_Spring, data = dat.LW)
+summary(model.2)
+
+model.2.inveatigate = cbind(dat.LW, model.fit = round(sqrt(2*model.2$fitted.values + 1), 0))
+model.2.inveatigate %>%
+  select(year, bloom_doy, model.fit) %>%
+  reshape2::melt(id = "year") %>%
+  ggplot() + geom_line(aes(x = year, y = value, color = variable)) + geom_point(aes(x = year, y = value, color = variable)) + scale_color_manual(values = cherry_cols) + labs(color='Type', title = "Linear Model 2") 
+
+```
+
+# Try the nonparametric model
+
+```{r}
+# put these functions in the source script
+
+epak_fun <- function(tcenter, t, bw){
+  n = length(t)
+  k = rep(0, n)
+  for(i in 1:n){
+    k[i] = single_epak_fun((t[i] - tcenter)/bw)
+  }
+  return(k) 
+}
+
+quadratic_single_fun <- function(teval, t_train, Y, design_matrix, bw){
+  p = NCOL(design_matrix)
+  X = design_matrix
+  tcenter = teval
+  wt = epak_fun(tcenter, t_train, bw)
+  X_append = X*(t_train - tcenter)
+  X_new = cbind(X, X_append)
+  traindata = cbind(Y, X_new)
+  traindata = data.frame(traindata)
+  est = lm(Y~.+0, data = traindata, weights = wt)$coef
+  beta_hat = as.matrix(est[1:p])
+  return(beta_hat)
+}
+
+Three_Cities_kernel_fun <- function(loc, final.dat, bw){
+  dat = final.dat %>%
+    filter(location == loc) 
+  
+  dat = na.omit(dat)
+  
+  train.dat = dat[1:(NROW(dat) - 10), ]
+  test.dat = dat[(NROW(dat) - 9): NROW(dat), ]
+  
+  N = NROW(train.dat)
+  t = (1:N)/N
+  Y = train.dat$bloom_doy
+  X = cbind(rep(1, N), train.dat$afdd, train.dat$tmin_avg_Spring, train.dat$tmax_avg_Spring)
+  colnames(X) <- c("Intercept", "afdd", "tmin_Spring", "tmax_Spring")
+  p = NCOL(X)
+  
+  beta_hat = lapply(t, quadratic_single_fun, t_train = t, Y = Y, design_matrix = X, bw = bw)
+  
+  estimated.intercept = Reduce('rbind', lapply(beta_hat, FUN = function(x){return(x['Intercept',])}))
+  estimated.afdd = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['afdd',])}))
+  estimated.tmin_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmin_Spring',])}))
+  estimated.tmax_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmax_Spring',])}))
+  
+  local.linear.fitted.values = estimated.intercept + estimated.afdd*train.dat$afdd + estimated.tmax_Spring*train.dat$tmax_avg_Spring + estimated.tmin_Spring*train.dat$tmin_avg_Spring
+  
+  local.linear.fitted.values = round(local.linear.fitted.values, 0)
+  R_square = 1 - sum((Y - local.linear.fitted.values)^2)/sum((Y - mean(Y))^2)
+  
+  coef.int = mean(estimated.intercept[(N - 3*floor(bw*N)):(N - floor(bw*N))])
+  coef.afdd = mean(estimated.afdd[(N - 3*floor(bw*N)):(N - floor(bw*N))])
+  coef.tmin_Spring = mean(estimated.tmin_Spring[(N - 3*floor(bw*N)):(N - floor(bw*N))])
+  coef.tmax_Spring = mean(estimated.tmax_Spring[(N - 3*floor(bw*N)):(N - floor(bw*N))])
+  # coef.int = mean(estimated.intercept[30:60])
+  # coef.afdd = mean(estimated.afdd[30:60])
+  # coef.tmin_Spring = mean(estimated.tmin_Spring[30:60])
+  # coef.tmax_Spring = mean(estimated.tmax_Spring[30:60])
+
+  test.fit = coef.int + coef.afdd*test.dat$afdd + coef.tmin_Spring*test.dat$tmin_avg_Spring +   coef.tmax_Spring*test.dat$tmax_avg_Spring
+  test.fit = round(test.fit, 0)
+  
+  train.MAE = mean(abs(Y - local.linear.fitted.values))
+  test.MAE = mean(abs(test.dat$bloom_doy - test.fit))
+  output = list(loc, R_square, train.MAE, test.MAE, test.fit)
+  names(output) <- c("location", "R_square", "train.MAE", "test.MAE", "test fit")
+  return(output)
+}
+
+Three_Cities_kernel_fun(loc = "liestal", final.dat, bw = 0.1)
+Three_Cities_kernel_fun(loc = "kyoto", final.dat, bw = 0.15)
+Three_Cities_kernel_fun(loc = "washingtondc", final.dat, bw = 0.1)
+
+
+
+
+# N = nrow(dat.LW[1:56, ])
+# N
+# t = (1:N)/N
+# Y = dat.LW$bloom_doy[1:56]
+# X = cbind(rep(1, N), dat.LW$afdd[1:56], dat.LW$tmin_avg_Spring[1:56], dat.LW$tmax_avg_Spring[1:56])
+# colnames(X) <- c("Intercept", "afdd", "tmin_Spring", "tmax_Spring")
+# p = NCOL(X)
+# 
+# estimator_type = "L2"
+# tau = 0.5
+# 
+# beta_hat = lapply(t, quadratic_single_fun, t_train = t, Y = Y, design_matrix = X, bw = 0.1)
+# 
+# 
+# estimated.intercept = Reduce('rbind', lapply(beta_hat, FUN = function(x){return(x['Intercept',])}))
+# estimated.afdd = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['afdd',])}))
+# estimated.tmin_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmin_Spring',])}))
+# estimated.tmax_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmax_Spring',])}))
+# 
+# 
+# local.linear.fitted.values = estimated.intercept + estimated.afdd*dat.LW$afdd[1:56] + estimated.tmax_Spring*dat.LW$tmax_avg_Spring[1:56] + estimated.tmin_Spring*dat.LW$tmin_avg_Spring[1:56]
+# local.linear.fitted.values = round(local.linear.fitted.values, 0)
+# model.cor = cor(local.linear.fitted.values, dat.LW$bloom_doy[1:56])
+# model.cor
+# # 
+# # local.inveatigate = cbind(dat.LW, model.fit = as.vector(local.linear.fitted.values))
+# # local.inveatigate %>%
+# #   select(year, bloom_doy, model.fit) %>%
+# #   reshape2::melt(id = "year") %>%
+# #   ggplot() + geom_line(aes(x = year, y = value, color = variable)) + geom_point(aes(x = year, y = value, color = variable)) + scale_color_manual(values = cherry_cols) + labs(color='Type', title = "Varying Coefficient Model")
+# # 
+# # 
+# 1 - sum((dat.LW$bloom_doy[1:56] - local.linear.fitted.values)^2)/sum((dat.LW$bloom_doy[1:56] - mean(dat.LW$bloom_doy[1:56]))^2)
+# # 0.8295548 for L2 full set
+# # 0.8792853 for L2 training set 
+# 
+# sum((dat.LW$bloom_doy[1:56] - local.linear.fitted.values)^2)/N
+# 
+# 
+# # Testing set
+# coef.int = mean(estimated.intercept[30:50])
+# coef.afdd = mean(estimated.afdd[30:50])
+# coef.tmin_Spring = mean(estimated.tmin_Spring[30:50])
+# coef.tmax_Spring = mean(estimated.tmax_Spring[30:50])
+# 
+# test.fit = coef.int + coef.afdd*dat.LW$afdd[57:66] + coef.tmin_Spring*dat.LW$tmin_avg_Spring[57:66] + coef.tmax_Spring*dat.LW$tmax_avg_Spring[57:66]
+# test.fit = round(test.fit, 0)
+# 
+# sum((dat.LW$bloom_doy[57:66] - test.fit)^2)/10
+# 
+# 
+# #absolute
+# mean(abs(dat.LW$bloom_doy[1:56] - local.linear.fitted.values))
+# mean(abs(dat.LW$bloom_doy[57:66] - test.fit))
+```
+
+
+#### Now let's try Kyoto
+```{r}
+dat.KT = na.omit(dat.KT)
+N = nrow(dat.KT[1:60, ])
+N
+t = (1:N)/N
+Y = dat.KT$bloom_doy[1:60]
+X = cbind(rep(1, N), dat.KT$afdd[1:60], dat.KT$tmin_avg_Spring[1:60], dat.KT$tmax_avg_Spring[1:60])
+colnames(X) <- c("Intercept", "afdd", "tmin_Spring", "tmax_Spring")
+p = NCOL(X)
+
+estimator_type = "L2"
+tau = 0.5
+
+beta_hat = lapply(t, quadratic_single_fun, t_train = t, Y = Y, design_matrix = X, bw = 0.15)
+
+
+estimated.intercept = Reduce('rbind', lapply(beta_hat, FUN = function(x){return(x['Intercept',])}))
+estimated.afdd = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['afdd',])}))
+estimated.tmin_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmin_Spring',])}))
+estimated.tmax_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmax_Spring',])}))
+
+
+local.linear.fitted.values = estimated.intercept + estimated.afdd*dat.KT$afdd[1:60] + estimated.tmax_Spring*dat.KT$tmax_avg_Spring[1:60] + estimated.tmin_Spring*dat.KT$tmin_avg_Spring[1:60]
+local.linear.fitted.values = round(local.linear.fitted.values, 0)
+model.cor = cor(local.linear.fitted.values, dat.KT$bloom_doy[1:60])
+model.cor
+
+
+coef.int = mean(estimated.intercept[30:60])
+coef.afdd = mean(estimated.afdd[30:60])
+coef.tmin_Spring = mean(estimated.tmin_Spring[30:60])
+coef.tmax_Spring = mean(estimated.tmax_Spring[30:60])
+
+test.fit = coef.int + coef.afdd*dat.KT$afdd[61:70] + coef.tmin_Spring*dat.KT$tmin_avg_Spring[61:70] + coef.tmax_Spring*dat.KT$tmax_avg_Spring[61:70]
+test.fit = round(test.fit, 0)
+
+sum((dat.KT$bloom_doy[61:70] - test.fit)^2)/10
+
+
+#absolute
+mean(abs(dat.KT$bloom_doy[1:60] - local.linear.fitted.values))
+mean(abs(dat.KT$bloom_doy[61:70] - test.fit))
+
+1 - sum((dat.KT$bloom_doy[1:60] - local.linear.fitted.values)^2)/sum((dat.KT$bloom_doy[1:60] - mean(dat.KT$bloom_doy[1:60]))^2)
+```
+
+
+
+```{r}
+# What about washington DC
+dat.DC = na.omit(dat.DC)
+N = nrow(dat.DC[1:60, ])
+N
+t = (1:N)/N
+Y = dat.DC$bloom_doy[1:60]
+X = cbind(rep(1, N), dat.DC$afdd[1:60], dat.DC$tmin_avg_Spring[1:60], dat.DC$tmax_avg_Spring[1:60])
+colnames(X) <- c("Intercept", "afdd", "tmin_Spring", "tmax_Spring")
+p = NCOL(X)
+
+estimator_type = "L2"
+tau = 0.5
+
+beta_hat = lapply(t, quadratic_single_fun, t_train = t, Y = Y, design_matrix = X, bw = 0.1)
+
+
+estimated.intercept = Reduce('rbind', lapply(beta_hat, FUN = function(x){return(x['Intercept',])}))
+estimated.afdd = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['afdd',])}))
+estimated.tmin_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmin_Spring',])}))
+estimated.tmax_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmax_Spring',])}))
+
+
+local.linear.fitted.values = estimated.intercept + estimated.afdd*dat.DC$afdd[1:60] + estimated.tmax_Spring*dat.DC$tmax_avg_Spring[1:60] + estimated.tmin_Spring*dat.DC$tmin_avg_Spring[1:60]
+local.linear.fitted.values = round(local.linear.fitted.values, 0)
+model.cor = cor(local.linear.fitted.values, dat.DC$bloom_doy[1:60])
+model.cor
+
+
+coef.int = mean(estimated.intercept[30:60])
+coef.afdd = mean(estimated.afdd[30:60])
+coef.tmin_Spring = mean(estimated.tmin_Spring[30:60])
+coef.tmax_Spring = mean(estimated.tmax_Spring[30:60])
+
+test.fit = coef.int + coef.afdd*dat.DC$afdd[61:70] + coef.tmin_Spring*dat.DC$tmin_avg_Spring[61:70] + coef.tmax_Spring*dat.DC$tmax_avg_Spring[61:70]
+test.fit = round(test.fit, 0)
+
+sum((dat.DC$bloom_doy[61:70] - test.fit)^2)/10
+
+
+#absolute
+mean(abs(dat.DC$bloom_doy[1:60] - local.linear.fitted.values))
+mean(abs(dat.DC$bloom_doy[61:70] - test.fit))
+
+1 - sum((dat.DC$bloom_doy[1:60] - local.linear.fitted.values)^2)/sum((dat.DC$bloom_doy[1:60] - mean(dat.DC$bloom_doy[1:60]))^2)
+```
+
+
+```{r}
+# input some available cherry blossom data of Vancouver
+# available from the website https://www.nps.gov/subjects/cherryblossom/bloom-watch.htm
+# If we apply the Washington DC model to the Vancouver data, then let's see how the prefiction result is like
+# time range is from 2004 - 2021
+
+# First we are going to construct the full model for the DC
+N = nrow(dat.DC)
+N
+t = (1:N)/N
+Y = dat.DC$bloom_doy
+X = cbind(rep(1, N), dat.DC$afdd, dat.DC$tmin_avg_Spring, dat.DC$tmax_avg_Spring)
+colnames(X) <- c("Intercept", "afdd", "tmin_Spring", "tmax_Spring")
+p = NCOL(X)
+
+estimator_type = "L2"
+tau = 0.5
+
+beta_hat = lapply(t, quadratic_single_fun, t_train = t, Y = Y, design_matrix = X, bw = 0.1)
+
+
+estimated.intercept = Reduce('rbind', lapply(beta_hat, FUN = function(x){return(x['Intercept',])}))
+estimated.afdd = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['afdd',])}))
+estimated.tmin_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmin_Spring',])}))
+estimated.tmax_Spring = Reduce('rbind',lapply(beta_hat, FUN = function(x){return(x['tmax_Spring',])}))
+
+
+local.linear.fitted.values = estimated.intercept + estimated.afdd*dat.DC$afdd + estimated.tmax_Spring*dat.DC$tmax_avg_Spring + estimated.tmin_Spring*dat.DC$tmin_avg_Spring
+local.linear.fitted.values = round(local.linear.fitted.values, 0)
+model.cor = cor(local.linear.fitted.values, dat.DC$bloom_doy)
+model.cor
+
+mean(abs(dat.DC$bloom_doy - local.linear.fitted.values))
+
+
+# Next since we have the estimated coefficients from 1950 - 2021 with 1953 omitted, so the 2004 - 2021 are [53:70]
+VC.fitted.values = estimated.intercept[53:70] + estimated.afdd[53:70]*dat.VC$afdd[30:47] + estimated.tmax_Spring[53:70]*dat.VC$tmax_avg_Spring[30:47] + estimated.tmin_Spring[53:70]*dat.VC$tmin_avg_Spring[30:47]
+#local.linear.fitted.values = round(local.linear.fitted.values, 0)
+VC.fitted.values = round(VC.fitted.values, 0)
+VC.fitted.values
+
+mean(abs(dat.VC$bloom_doy[32:47] - VC.fitted.values[3:17]))
+```
+
+
+
+
+
+
+
+
+
+## Appendix: Adding Covariates {#appendix-rnoaa}
+
+We encourage you to find additional publicly-available data that will improve your predictions. For example, one source of global meteorological data comes from the Global Historical Climatology Network (GHCN), available in the `rnoaa` package. The package can also be installed via 
+
+```{r, eval = FALSE}
+install.packages("rnoaa")
+```
+
+and the loaded via
+
+```{r}
+library(rnoaa)
+```
+
+The list of stations can be retrieved using the `ghcnd_stations()` function. Note that the closest weather station to each city with continuously collected maximum temperatures are USC00186350 (Washington D.C.), GME00127786 (Liestal), JA000047759 (Kyoto), and CA001108395 (Vancouver).
+
+```{r, eval = FALSE}
+stations <- ghcnd_stations()
+```
+
+As a simple demonstration, we retrieve the average seasonal maximum daily temperature (in 1/10 °C) from these stations using our own `get_temperature()` function, which wraps the `ghcnd_search()` function in the `rnoaa` package. (N.b. `ghcnd_search()` returns a list. Each element of the list corresponds to an element of the `var` argument.)
+
+```{r}
+#' Get the annual average maximum temperature at the given station,
+#' separated into the 4 meteorological seasons (Winter, Spring, Summer, Fall).
+#' 
+#' The seasons are span 3 months each.
+#' Winter is from December to February, Spring from March to May,
+#' Summer from June to August, and Fall from September to November.
+#' Note that December is counted towards the Winter of the next year, i.e.,
+#' temperatures in December 2020 are accounted for in Winter 2021.
+#' 
+#' @param stationid the `rnoaa` station id (see [ghcnd_stations()])
+#' @return a data frame with columns
+#'   - `year` ... the year of the observations
+#'   - `season` ... the season (Winter, Spring, Summer, Fall)
+#'   - `tmax_avg` ... average maximum temperate in tenth degree Celsius
+get_temperature <- function (stationid) {
+  ghcnd_search(stationid = stationid, var = c("tmax"), 
+               date_min = "1950-01-01", date_max = "2022-01-31")[[1]] %>%
+  mutate(year = as.integer(format(date, "%Y")),
+         month = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+         season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                      include.lowest = TRUE,
+                      labels = c("Winter", "Spring", "Summer", "Fall")),
+         year = if_else(month == 0, year + 1L, year)) %>%
+  group_by(year, season) %>%
+  summarize(tmax_avg = mean(tmax, na.rm = TRUE))
+}
+
+historic_temperatures <-
+  tibble(location = "washingtondc", get_temperature("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_temperature("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_temperature("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_temperature("CA001108395")))
+
+historic_temperatures %>%
+  ggplot() + 
+  aes(year, tmax_avg) + 
+  geom_line() +
+  xlim(1950, 2031) +
+  labs(x = "Year", y = "Average maximum temperature (1/10 °C)") +
+  facet_grid(factor(season) ~ str_to_title(location))
+```
+
+
+
+
+
+
+
+
+## Preparing the submission file
+
+Once we have the predictions for all four sites, we have to save them in the correct format for the competition.
+
+```{r}
+submission_predictions <- predictions %>% 
+  filter(year > 2021) %>% 
+  mutate(predicted_doy = round(predicted_doy)) %>% 
+  pivot_wider(names_from = 'location', values_from = 'predicted_doy') %>% 
+  select(year, kyoto, liestal, washingtondc, vancouver)
+
+submission_predictions
+```
+
+For submission, these predictions must be saved as a CSV file.
+**Important:** the CSV file must not have row names, which R adds by default. Specify `row.names=FALSE` to suppress them:
+
+```{r, eval=FALSE}
+write.csv(submission_predictions, file = "cherry-predictions.csv",
+          row.names = FALSE)
+```
+
